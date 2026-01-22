@@ -131,6 +131,53 @@ uv run pytest tests/test_intent_classifier.py -v
    lk agent deploy
    ```
 
+## Voice Regression Checklist
+
+Before deploying changes, run these manual voice tests to catch regressions.
+
+### Test Scenarios
+
+Run each scenario in console mode and verify the conversation flows naturally:
+
+1. **New Quote Request**
+   - Say: "Hi, I'm looking to get a quote for car insurance"
+   - Aizellee should collect: name, callback number, business/personal, relevant details
+
+2. **ID Card Request**
+   - Say: "I need my insurance ID cards"
+   - Aizellee should collect: name, callback number, policy type info
+
+3. **Claims Call After-Hours**
+   - Say: "I need to file a claim, my car was in an accident"
+   - Aizellee should recognize claims intent and collect caller info
+
+### What to Listen For
+
+| Issue | Description |
+|-------|-------------|
+| Awkward interruptions | Agent cuts off mid-sentence or at wrong times |
+| Long pauses | Silence > 2 seconds between turns |
+| Repeated questions | Asks for same info twice |
+| Robotic phrasing | Unnatural word choices or cadence |
+| Barge-in broken | Cannot interrupt agent while speaking |
+
+### Running Voice Tests
+
+```bash
+# Start console mode with mic/speaker
+uv run python agent.py console
+```
+
+**Pass criteria:**
+- Conversation feels natural
+- All required fields captured correctly
+- No issues from the checklist above
+
+**Fail criteria:**
+- Any issue from the checklist occurs
+- Intent misclassified
+- Required fields missing from final RouteDecision
+
 ## Resources
 
 - [LiveKit Agents Documentation](https://docs.livekit.io/agents/)

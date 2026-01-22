@@ -419,6 +419,43 @@ if __name__ == "__main__":
 
 Remember: The goal is to create simple yet powerful voice AI agents that provide natural, responsive conversations with users!
 
+## Quality Gates (Required)
+
+Before marking ANY task as complete:
+
+1. **Always run `make check`** - This runs formatting/linting and pytest
+2. **For intent/routing/state changes, also run `make sim`** - This runs golden transcript simulations
+
+If either command fails, fix the issues before declaring success.
+
+## Logging Contract (Required)
+
+The agent MUST follow this logging format:
+
+1. **USER_INPUT line** - One per user message:
+   ```
+   USER_TEXT: "<text>" | source=<chat|transcript> | intent_before=<...> | intent_after=<...>
+   ```
+
+2. **CAPTURED lines** - Only on state change:
+   ```
+   CAPTURED: <field>=<value>
+   ```
+
+3. **FINAL RouteDecision** - Once per session at end:
+   ```
+   ROUTE_DECISION: intent=<...> | caller_name=<...> | callback_phone=<...> | ...
+   ```
+
+## KISS Rules
+
+Follow these principles to keep the codebase simple:
+
+1. **No refactors unless requested** - Don't refactor code unless the user explicitly asks
+2. **Deterministic intent only** - Use regex-based classify_intent. LLM fallback comes in Phase 2 after routing is working
+3. **Prefer adding tests over adding complexity** - When in doubt, add a test rather than adding abstraction
+4. **Minimal edits** - Make the smallest change that solves the problem
+
 ---
 
 ## 🐝 Claude Code Agents & Swarm Command

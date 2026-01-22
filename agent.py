@@ -9,9 +9,19 @@ Uses function tools to capture caller information and update the RouteDecision.
 
 import logging
 import re
+import time
 
 from dotenv import load_dotenv
-from livekit.agents import Agent, AgentSession, JobContext, JobProcess, RunContext, WorkerOptions, cli, function_tool
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    JobProcess,
+    RunContext,
+    WorkerOptions,
+    cli,
+    function_tool,
+)
 from livekit.plugins import deepgram, openai, silero
 
 from models import (
@@ -28,8 +38,7 @@ load_dotenv()
 
 # Configure logging to show DEBUG messages
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 logger = logging.getLogger("aizellee")
@@ -37,13 +46,41 @@ logger = logging.getLogger("aizellee")
 logger.setLevel(logging.DEBUG)
 
 
+# Filler words/phrases to skip when recording intent
+FILLER_WORDS: set[str] = {
+    "yep",
+    "nope",
+    "yeah",
+    "uh-huh",
+    "uh huh",
+    "thanks",
+    "thank you",
+    "ok",
+    "okay",
+    "yes",
+    "no",
+    "sure",
+    "right",
+    "alright",
+    "got it",
+    "mm-hmm",
+    "mmhmm",
+    "mhm",
+}
+
+
 # Word-to-digit mapping for phone number normalization
 WORD_TO_DIGIT = {
-    "zero": "0", "oh": "0", "o": "0",
+    "zero": "0",
+    "oh": "0",
+    "o": "0",
     "one": "1",
-    "two": "2", "to": "2", "too": "2",
+    "two": "2",
+    "to": "2",
+    "too": "2",
     "three": "3",
-    "four": "4", "for": "4",
+    "four": "4",
+    "for": "4",
     "five": "5",
     "six": "6",
     "seven": "7",
@@ -55,14 +92,14 @@ WORD_TO_DIGIT = {
 def normalize_phone_number(phone: str) -> str:
     """
     Normalize a phone number to digits only.
-    
+
     Handles:
     - Removing non-digit characters (spaces, dashes, parentheses)
     - Converting spoken word numbers to digits ("five five five" -> "555")
-    
+
     Args:
         phone: Raw phone number string from caller
-        
+
     Returns:
         Digits-only string
     """
@@ -71,17 +108,17 @@ def normalize_phone_number(phone: str) -> str:
     converted = []
     for word in words:
         # Remove common punctuation from word
-        clean_word = re.sub(r'[^\w]', '', word)
+        clean_word = re.sub(r"[^\w]", "", word)
         if clean_word in WORD_TO_DIGIT:
             converted.append(WORD_TO_DIGIT[clean_word])
         else:
             # Keep the original word (will be stripped of non-digits later)
             converted.append(word)
-    
+
     # Join and strip all non-digit characters
-    result = ''.join(converted)
-    digits_only = re.sub(r'\D', '', result)
-    
+    result = "".join(converted)
+    digits_only = re.sub(r"\D", "", result)
+
     return digits_only
 
 
@@ -92,33 +129,62 @@ GREETING (EXACT - DO NOT MODIFY):
 When the call begins, say EXACTLY: "Thank you for calling Harry Levine Insurance, this is Aizellee, how can I help you?"
 
 VOICE BEHAVIOR:
-- Speak naturally and conversationally, as if you're a helpful receptionist on a phone call
-- Keep responses concise (1-2 sentences when possible)
-- Use verbal confirmations like "Got it", "Sure", "Okay, let me note that down"
-- Be warm, patient, and professional
-- Spell back important information (names, phone numbers) to confirm accuracy
+- Speak naturally and conversationally, like a friendly receptionist
+- Keep responses short - one sentence when possible
+- Use brief confirmations: "Got it", "Sure thing", "Perfect"
+- Be warm and professional
+- Read back phone numbers to confirm
 
-CONVERSATION FLOW:
-You must collect the following information in order:
-1. Caller's name (first and last)
-2. Callback phone number
-3. Reason for calling (classify into one of the intent categories)
-4. Business or personal insurance
-5. Based on the answer to #4:
-   - If BUSINESS: Ask for the business name
-   - If PERSONAL: Ask for the last name on the policy and spelling if unclear
+CRITICAL - INTENT IS AUTO-CAPTURED:
+The system AUTOMATICALLY captures the caller's intent. Once they state their reason, acknowledge it briefly and move on - do NOT re-ask or confirm the intent.
+
+Examples of brief acknowledgments:
+- "Got it - a quote."
+- "Sure, I can help with that."
+- "No problem."
+
+Then proceed directly to collecting their information.
+
+CONVERSATION FLOW - DRIVEN BY MISSING FIELDS:
+After acknowledging their reason for calling, collect info in this order:
+
+1. If caller_name AND callback_phone are BOTH missing -> Combine: "Can I get your name and the best number to reach you?"
+   - If they only give one, ask for the other naturally: "And the number?" or "And your name?"
+
+2. If only caller_name is missing -> "And your name?"
+
+3. If only callback_phone is missing -> "What's the best number to reach you?"
+   - Read it back: "Got it, [number] - is that right?"
+
+4. If insurance_type is missing -> "Is this for business or personal?"
+
+5. Based on (intent, insurance_type), collect the identifier:
+
+   FOR NEW QUOTES (intent = new_quote):
+   - Business: "What's the business name?"
+   - Personal: "And the last name?" (accept as given, don't ask to spell)
+
+   FOR EXISTING POLICY SERVICING (all other intents):
+   - Business: "What's the business name on the policy?"
+   - Personal: "What's the last name on the policy?"
+     * For policy servicing, confirm unclear names by asking to spell if needed
+
+6. When all fields are collected -> Wrap up the call
+
+Never ask for info you already have. Never re-ask intent after they've stated it.
 
 IMPORTANT - RECORDING INFORMATION:
-You MUST call the appropriate function tool IMMEDIATELY after collecting each piece of information. Do NOT wait until the end of the call. Call the tools as follows:
-- When you get the caller's name: call record_caller_name(name)
-- When you get the phone number: call record_callback_phone(phone)
-- When you understand why they're calling: call record_intent(raw_text) with their exact words about why they're calling
-- When you learn if it's business or personal: call record_insurance_type(insurance_type) with "business" or "personal"
-- When you get the business name: call record_business_name(business_name)
-- When you get the policy last name: call record_policy_last_name(last_name)
+Call the appropriate function tool IMMEDIATELY after collecting each piece of information:
+- record_caller_name(name) - when you get their name
+- record_callback_phone(phone) - when you get the number
+- record_insurance_type(insurance_type) - "business" or "personal"
+- record_business_name(business_name) - for business inquiries
+- record_policy_last_name(last_name) - for personal inquiries
 
-INTENT CLASSIFICATION:
-Listen carefully to why they're calling and classify into ONE of these categories:
+Do NOT call record_intent - it's handled automatically by the system.
+
+INTENT CLASSIFICATION (FOR REFERENCE ONLY - AUTO-CAPTURED):
+The system classifies intents into these categories:
 - new_quote: Wants a new insurance quote or policy
 - payment_or_id_dec: Payment questions, needs ID cards, or declarations page
 - make_change: Wants to change something on existing policy (add vehicle, change address, etc.)
@@ -132,25 +198,15 @@ Listen carefully to why they're calling and classify into ONE of these categorie
 - hours_location: Asking about office hours or location
 - specific_agent: Asking for a specific person by name
 
-COLLECTING INFORMATION:
-- Ask for the caller's name first: "May I have your name please?"
-- Then ask for callback number: "And what's a good callback number?"
-- Read back the phone number to confirm: "Just to confirm, that's [number], correct?"
-- Listen to their reason for calling and classify it
-- Ask: "Is this for your business or personal insurance?"
-- Based on their answer:
-  * Business: "What's the name of the business?"
-  * Personal: "What's the last name on the policy?" (If unclear: "Could you spell that for me?")
-
 HANDLING UNCLEAR RESPONSES:
-- If you don't understand something, ask once for clarification
-- If still unclear, say "I want to make sure I get this right" and ask them to repeat or spell it
-- Never guess at important information like names or phone numbers
+- If unclear, ask once: "Sorry, could you say that again?"
+- If still unclear: "I want to make sure I get this right - could you spell that for me?"
+- Never guess at names or phone numbers
 
 ENDING THE CALL:
-Once you have all information, summarize: "Alright, I have you down as [name] at [phone number], calling about [reason] for your [business/personal] insurance, [business name or last name on policy]. We'll have someone get back to you shortly. Is there anything else I can help you with?"
+Once you have everything: "Alright [name], I've got you at [phone number], calling about [reason] for your [business/personal] insurance. Someone will be in touch soon. Anything else I can help with?"
 
-If they say no: "Thank you for calling Harry Levine Insurance. Have a great day!"
+If they say no: "Thanks for calling Harry Levine Insurance. Have a great day!"
 
 THINGS TO AVOID:
 - Don't offer specific insurance advice or quotes
@@ -158,8 +214,91 @@ THINGS TO AVOID:
 - Don't discuss policy details you don't have access to
 - Don't use text formatting (bullets, numbers, asterisks)
 - Don't use emojis
-- If asked something outside your role, say "I'll make sure to pass that along to the team"
+- Don't ask why they're calling if they already told you
+- Don't call the record_intent tool - it's handled automatically
+- If asked something outside your role: "I'll make sure to pass that along to the team"
 """
+
+
+# Intent-change signal patterns that indicate caller wants to override
+INTENT_CHANGE_SIGNALS = (
+    "actually",
+    "never mind",
+    "nevermind",
+    "instead",
+    "no wait",
+    "i meant",
+    "sorry, i need",
+    "sorry i need",
+)
+
+
+def maybe_record_intent(userdata: AizelleeUserData, raw_text: str) -> str | None:
+    """
+    Classify and record intent from raw text into userdata.
+
+    This helper extracts the core intent classification logic so it can be called
+    from both the @function_tool and other contexts (e.g., automatic intent capture).
+
+    Args:
+        userdata: The AizelleeUserData containing the route_decision to update.
+        raw_text: The caller's original statement about why they're calling.
+
+    Returns:
+        A status message string if intent was recorded or already exists,
+        or None if the text was skipped (e.g., filler words).
+    """
+    # Skip filler words - return None to indicate nothing was recorded
+    if raw_text.lower().strip() in FILLER_WORDS:
+        logger.debug(f"INTENT SKIPPED: Filler word detected: {raw_text}")
+        return None
+
+    # DEBUG: Log raw transcript received
+    logger.debug(f"DEBUG: Raw transcript received: {raw_text}")
+
+    # DEBUG: Log classifier input
+    logger.debug(f"DEBUG: Classifier input: {raw_text}")
+
+    # Use classify_intent to determine the intent from the raw text
+    # This ensures consistent classification matching what tests use
+    classified_intent = classify_intent(raw_text)
+
+    # DEBUG: Log classifier output
+    logger.debug(f"DEBUG: Classifier output: {classified_intent}")
+
+    # Convert string to IntentCategory enum
+    try:
+        intent_enum = IntentCategory(classified_intent)
+    except ValueError:
+        intent_enum = IntentCategory.SOMETHING_ELSE
+
+    # Check if intent is already set - apply persistence logic
+    current_intent = userdata.route_decision.intent
+    if current_intent is not None:
+        raw_text_lower = raw_text.lower()
+
+        # Check for intent-change signals
+        has_change_signal = any(signal in raw_text_lower for signal in INTENT_CHANGE_SIGNALS)
+
+        # Check if upgrading from SOMETHING_ELSE to a more specific intent
+        is_upgrade_from_something_else = (
+            current_intent == IntentCategory.SOMETHING_ELSE
+            and intent_enum != IntentCategory.SOMETHING_ELSE
+        )
+
+        # Only overwrite if there's a change signal or upgrading from SOMETHING_ELSE
+        if not has_change_signal and not is_upgrade_from_something_else:
+            logger.debug(
+                f"INTENT PERSISTENCE: Keeping existing intent '{current_intent.value}' "
+                f"(new classification was '{intent_enum.value}' from: {raw_text})"
+            )
+            return f"Intent already recorded as: {current_intent.value}"
+
+    userdata.route_decision.intent = intent_enum
+    userdata.route_decision.intent_raw_text = raw_text
+    # DEBUG: Log when state.intent is set
+    logger.debug(f"DEBUG: state.intent SET to {intent_enum.value} with raw_text: {raw_text}")
+    return f"Recorded intent: {intent_enum.value}"
 
 
 class AizelleeAgent(Agent):
@@ -215,71 +354,35 @@ class AizelleeAgent(Agent):
 
     @function_tool()
     async def record_intent(self, context: RunContext, raw_text: str) -> str:
-        """Record the caller's reason for calling.
+        """INTERNAL USE ONLY - DO NOT CALL THIS TOOL.
+
+        Intent is captured AUTOMATICALLY from the caller's first transcript.
+        The system handles intent classification without LLM intervention.
+
+        If you call this tool, it will be ignored and you will receive a warning.
 
         Args:
             raw_text: The caller's original statement about why they're calling (verbatim).
         """
-        userdata: AizelleeUserData = context.userdata
-        
-        # DEBUG: Log raw transcript received
-        logger.debug(f"DEBUG: Raw transcript received: {raw_text}")
-        
-        # Intent-change signal patterns that indicate caller wants to override
-        INTENT_CHANGE_SIGNALS = (
-            "actually",
-            "never mind",
-            "nevermind", 
-            "instead",
-            "no wait",
-            "i meant",
-            "sorry, i need",
-            "sorry i need",
-        )
-        
-        # DEBUG: Log classifier input
-        logger.debug(f"DEBUG: Classifier input: {raw_text}")
-        
-        # Use classify_intent to determine the intent from the raw text
-        # This ensures consistent classification matching what tests use
-        classified_intent = classify_intent(raw_text)
-        
-        # DEBUG: Log classifier output
-        logger.debug(f"DEBUG: Classifier output: {classified_intent}")
-        
-        # Convert string to IntentCategory enum
-        try:
-            intent_enum = IntentCategory(classified_intent)
-        except ValueError:
-            intent_enum = IntentCategory.SOMETHING_ELSE
-        
-        # Check if intent is already set - apply persistence logic
-        current_intent = userdata.route_decision.intent
-        if current_intent is not None:
-            raw_text_lower = raw_text.lower()
-            
-            # Check for intent-change signals
-            has_change_signal = any(signal in raw_text_lower for signal in INTENT_CHANGE_SIGNALS)
-            
-            # Check if upgrading from SOMETHING_ELSE to a more specific intent
-            is_upgrade_from_something_else = (
-                current_intent == IntentCategory.SOMETHING_ELSE 
-                and intent_enum != IntentCategory.SOMETHING_ELSE
-            )
-            
-            # Only overwrite if there's a change signal or upgrading from SOMETHING_ELSE
-            if not has_change_signal and not is_upgrade_from_something_else:
-                logger.debug(
-                    f"INTENT PERSISTENCE: Keeping existing intent '{current_intent.value}' "
-                    f"(new classification was '{intent_enum.value}' from: {raw_text})"
-                )
-                return f"Intent already recorded as: {current_intent.value}"
+        # Log that LLM tried to call this tool (it shouldn't)
+        logger.warning(f"LLM called record_intent tool (should be auto-captured): {raw_text}")
 
-        userdata.route_decision.intent = intent_enum
-        userdata.route_decision.intent_raw_text = raw_text
-        # DEBUG: Log when state.intent is set
-        logger.debug(f"DEBUG: state.intent SET to {intent_enum.value} with raw_text: {raw_text}")
-        return f"Recorded intent: {intent_enum.value}"
+        userdata: AizelleeUserData = context.userdata
+
+        # If intent is already set, don't override
+        if userdata.route_decision.intent is not None:
+            return (
+                f"Intent already recorded as: {userdata.route_decision.intent}. No action needed."
+            )
+
+        result = maybe_record_intent(userdata, raw_text)
+
+        # If maybe_record_intent returns None (filler word), return a message
+        # indicating no intent change was made
+        if result is None:
+            return "No intent recorded (filler word detected)"
+
+        return result
 
     @function_tool()
     async def record_insurance_type(self, context: RunContext, insurance_type: str) -> str:
@@ -336,6 +439,9 @@ class AizelleeAgent(Agent):
         # Get userdata from session
         userdata: AizelleeUserData = self.session.userdata
 
+        # Store monotonic start time for call duration tracking
+        userdata.call_start_time = time.monotonic()
+
         # Mark greeting as given
         userdata.greeting_given = True
         userdata.advance_state(ConversationState.COLLECT_NAME)
@@ -344,7 +450,7 @@ class AizelleeAgent(Agent):
         # The LLM will handle the rest of the conversation naturally
         await self.session.say(
             "Thank you for calling Harry Levine Insurance, this is Aizellee, how can I help you?",
-            allow_interruptions=True
+            allow_interruptions=True,
         )
 
     async def on_exit(self) -> None:
@@ -358,14 +464,25 @@ class AizelleeAgent(Agent):
         userdata: AizelleeUserData = self.session.userdata
         route_decision = userdata.route_decision
 
+        # Calculate call duration from monotonic start time
+        if userdata.call_start_time > 0:
+            route_decision.call_duration_seconds = round(
+                time.monotonic() - userdata.call_start_time, 1
+            )
+
         # DEBUG: Log each field individually before final log
         logger.debug(f"FINAL caller_name: {route_decision.caller_name}")
         logger.debug(f"FINAL callback_phone: {route_decision.callback_phone}")
-        logger.debug(f"FINAL intent: {route_decision.intent.value if route_decision.intent else None}")
+        logger.debug(
+            f"FINAL intent: {route_decision.intent.value if route_decision.intent else None}"
+        )
         logger.debug(f"FINAL intent_raw_text: {route_decision.intent_raw_text}")
-        logger.debug(f"FINAL insurance_type: {route_decision.insurance_type.value if route_decision.insurance_type else None}")
+        logger.debug(
+            f"FINAL insurance_type: {route_decision.insurance_type.value if route_decision.insurance_type else None}"
+        )
         logger.debug(f"FINAL business_name: {route_decision.business_name}")
         logger.debug(f"FINAL policy_last_name: {route_decision.policy_last_name}")
+        logger.debug(f"FINAL call_duration_seconds: {route_decision.call_duration_seconds}")
 
         # Mark if conversation was complete
         route_decision.conversation_complete = route_decision.is_complete()
@@ -395,9 +512,23 @@ def prewarm(proc: JobProcess) -> None:
     """
     Prewarm function to load VAD model once per process.
     This avoids loading the model for each session, reducing latency.
+
+    VAD Configuration Tuning:
+    - min_silence_duration=0.4: Reduced from default 0.55 for faster turn detection
+      while still allowing natural pauses in speech
+    - min_speech_duration=0.08: Slightly higher than default 0.05 to filter out
+      brief noise bursts while keeping responsive to real speech
+    - activation_threshold=0.5: Default value works well for most environments
+    - prefix_padding_duration=0.3: Reduced from default 0.5 to capture speech start
+      without excessive pre-roll that can feel laggy
     """
-    proc.userdata["vad"] = silero.VAD.load()
-    logger.info("VAD model prewarmed and ready")
+    proc.userdata["vad"] = silero.VAD.load(
+        min_silence_duration=0.4,  # Faster turn detection (default: 0.55)
+        min_speech_duration=0.08,  # Filter brief noise (default: 0.05)
+        activation_threshold=0.5,  # Standard threshold (default: 0.5)
+        prefix_padding_duration=0.3,  # Tighter audio capture (default: 0.5)
+    )
+    logger.info("VAD model prewarmed with tuned settings")
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -407,9 +538,15 @@ async def entrypoint(ctx: JobContext) -> None:
     Creates an AgentSession with:
     - STT: Deepgram (nova-2 model)
     - LLM: OpenAI (gpt-4o-mini)
-    - TTS: OpenAI (alloy voice)
-    - VAD: Silero (prewarmed)
+    - TTS: OpenAI (nova voice - more natural than alloy)
+    - VAD: Silero (prewarmed with tuned settings)
     - Turn detection: VAD-based only (no semantic)
+
+    Turn-taking Configuration:
+    - min_endpointing_delay=0.4: Reduced from default 0.5 for snappier responses
+    - min_interruption_duration=0.4: Slightly lower than default 0.5 for responsive barge-in
+    - false_interruption_timeout=1.5: Reduced from default 2.0 to resume faster after false pauses
+    - resume_false_interruption=True: Ensures agent resumes after accidental interruptions
     """
     logger.info("Starting Aizellee agent session for room: %s", ctx.room.name)
 
@@ -421,26 +558,102 @@ async def entrypoint(ctx: JobContext) -> None:
     session = AgentSession(
         # Speech-to-Text: Deepgram nova-2 for fast, accurate transcription
         stt=deepgram.STT(model="nova-2"),
-
         # Large Language Model: OpenAI gpt-4o-mini for cost-effective reasoning
         llm=openai.LLM(model="gpt-4o-mini"),
-
-        # Text-to-Speech: OpenAI with alloy voice for natural speech
-        tts=openai.TTS(voice="alloy"),
-
-        # Voice Activity Detection: Silero (prewarmed)
+        # Text-to-Speech: OpenAI with nova voice for more natural, warm speech
+        # Nova is a feminine voice known for natural conversational quality
+        # Alternative options: echo (masculine), shimmer (soft feminine)
+        tts=openai.TTS(voice="nova"),
+        # Voice Activity Detection: Silero (prewarmed with tuned settings)
         vad=ctx.proc.userdata["vad"],
-
-        # Turn detection: VAD-based only (simpler, no semantic model)
+        # Turn detection: VAD-based only (simpler, works with any language)
         # This detects turn completion based on silence after speech
         turn_detection="vad",
-
         # Allow interruptions for natural conversation flow
         allow_interruptions=True,
-
+        # Faster endpointing for snappier responses (default: 0.5)
+        min_endpointing_delay=0.4,
+        # Lower threshold for responsive barge-in (default: 0.5)
+        min_interruption_duration=0.4,
+        # Faster recovery from false interruptions (default: 2.0)
+        false_interruption_timeout=1.5,
+        # Resume speaking after false interruptions (e.g., background noise)
+        resume_false_interruption=True,
         # Store userdata for state tracking
         userdata=userdata,
     )
+
+    # Track message IDs that originated from STT transcripts (vs chat input)
+    _transcript_message_ids: set[str] = set()
+
+    # Register event handler to capture intent from first meaningful transcript
+    @session.on("user_input_transcribed")
+    def on_user_transcript(transcript) -> None:
+        """Automatically capture intent from the first meaningful user transcript."""
+        if not transcript.is_final:
+            return
+
+        raw_text = transcript.transcript.strip()
+        if not raw_text:
+            return
+
+        # Track this transcript text so conversation_item_added knows the source
+        # We use the text itself as a simple identifier since message IDs aren't available here
+        _transcript_message_ids.add(raw_text)
+
+        # Capture intent before processing
+        intent_before = userdata.route_decision.intent
+
+        # Only attempt to record intent if not yet set
+        if userdata.route_decision.intent is None:
+            result = maybe_record_intent(userdata, raw_text)
+            if result:
+                logger.debug(f"AUTO-INTENT: {result}")
+
+        # Capture intent after processing
+        intent_after = userdata.route_decision.intent
+
+        # Always log transcript with intent state
+        logger.debug(
+            f'TRANSCRIPT: "{raw_text}" | intent_before={intent_before} | intent_after={intent_after}'
+        )
+
+    # Register event handler for conversation items (captures both chat and STT)
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(ev) -> None:
+        """Capture intent from any user message (chat or transcript)."""
+        # Only process user messages
+        if ev.item.role != "user":
+            return
+
+        # Extract text content
+        text = ev.item.text_content
+        if not text or not text.strip():
+            return
+
+        text = text.strip()
+
+        # Determine source: if text was already seen via transcript handler, it's from STT
+        if text in _transcript_message_ids:
+            source = "transcript"
+            # Remove from set to avoid memory buildup (one-time use)
+            _transcript_message_ids.discard(text)
+        else:
+            source = "chat"
+
+        # Capture intent before processing
+        intent_before = userdata.route_decision.intent
+
+        # Call maybe_record_intent for unified intent capture
+        maybe_record_intent(userdata, text)
+
+        # Capture intent after processing
+        intent_after = userdata.route_decision.intent
+
+        # Debug logging with source information
+        logger.debug(
+            f'USER_TEXT: "{text}" | source={source} | intent_before={intent_before} | intent_after={intent_after}'
+        )
 
     # Create the agent instance
     agent = create_aizellee_agent()

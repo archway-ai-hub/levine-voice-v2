@@ -76,6 +76,7 @@ python-developer, audio-engineer (yellow)
 agent-organizer, code-reviewer, llm-specialist (orange)
 test-engineer (green)
 devops-engineer (cyan)
+observability-sheriff, regression-guardian (magenta)
 Explore, Plan, general-purpose (white/default)
 ```
 
@@ -112,6 +113,8 @@ Available agents:
 - test-engineer: Unit/integration tests, voice agent behavioral testing
 - devops-engineer: CI/CD, Docker, LiveKit Cloud deployment
 - code-reviewer: Code quality review
+- observability-sheriff: Logging contract checks, ensures USER_TEXT/CAPTURED/ROUTE_DECISION logs are present
+- regression-guardian: Final quality gate, runs make check + make sim before declaring success
 - general-purpose: Complex research
 
 Available MCP tools (use when beneficial):
@@ -432,6 +435,43 @@ After all phases, show comprehensive metrics:
 | | **Explore** | Research | Small |
 | | **Plan** | Architecture | Medium |
 | | **general-purpose** | General | Large |
+
+### Final Gates
+| Color | Agent | Domain | Token Usage |
+|-------|-------|--------|-------------|
+| magenta | **regression-guardian** | Final quality gate - runs `make check` + `make sim` | Small-Medium |
+| magenta | **observability-sheriff** | Logging contract checks, minimal validation | Small |
+
+## Default Swarm Order
+
+Swarm should always run agents in this order:
+
+1. **agent-organizer** - Plan and delegate tasks
+2. **voice-ai-developer / python-developer** - Implementation work
+3. **audio-engineer** - Only for voice polish tasks
+4. **test-engineer** - Write and run tests
+5. **observability-sheriff** - Logging contract checks (minimal)
+6. **regression-guardian** - Final gate: run `make check` + `make sim`
+
+**IMPORTANT**: `regression-guardian` must be the final step before declaring success.
+
+## When to Use Each Agent
+
+| Agent | When to Use |
+|-------|-------------|
+| **agent-organizer** | First step for any complex task. Decomposes work and assigns to specialized agents. |
+| **voice-ai-developer** | AgentSession setup, voice pipelines, STT/TTS/LLM integration, function tools, multi-agent handoffs. |
+| **python-developer** | Async code, API integrations, Pydantic models, backend logic, data processing. |
+| **audio-engineer** | VAD tuning, noise cancellation, STT/TTS quality, audio processing. Only for voice polish tasks. |
+| **llm-specialist** | Prompt engineering, function calling design, context management, model selection. |
+| **test-engineer** | Unit tests, integration tests, behavioral testing for voice agents. |
+| **devops-engineer** | CI/CD pipelines, Docker, LiveKit Cloud deployment, environment configuration. |
+| **code-reviewer** | Code quality review, best practices, security review. |
+| **observability-sheriff** | Verify logging contracts are followed. Checks USER_INPUT, CAPTURED, and FINAL log formats. |
+| **regression-guardian** | Use as the FINAL gate before marking any implementation task complete. Runs `make check` and `make sim` to verify no regressions. |
+| **Explore** | Codebase exploration, finding files, understanding existing patterns. |
+| **Plan** | Architecture design, high-level planning. |
+| **general-purpose** | Complex research requiring multiple tool calls and reasoning. |
 
 ## Token Usage Guide
 

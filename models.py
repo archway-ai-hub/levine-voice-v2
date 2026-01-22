@@ -11,6 +11,7 @@ Contains:
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -21,6 +22,7 @@ logger = logging.getLogger("aizellee")
 
 class IntentCategory(Enum):
     """Classification categories for caller intent."""
+
     NEW_QUOTE = "new_quote"
     PAYMENT_OR_ID_DEC = "payment_or_id_dec"
     MAKE_CHANGE = "make_change"
@@ -37,12 +39,14 @@ class IntentCategory(Enum):
 
 class InsuranceType(Enum):
     """Type of insurance the caller is inquiring about."""
+
     BUSINESS = "business"
     PERSONAL = "personal"
 
 
 class ConversationState(Enum):
     """Tracks where we are in the conversation flow."""
+
     GREETING = "greeting"
     COLLECT_NAME = "collect_name"
     COLLECT_PHONE = "collect_phone"
@@ -63,6 +67,7 @@ class RouteDecision:
     Represents the complete routing decision for a call.
     Logged at the end of each conversation for analytics and follow-up.
     """
+
     # Caller identification
     caller_name: str = ""
     callback_phone: str = ""
@@ -161,6 +166,7 @@ class AizelleeUserData:
     Stores all conversation state and collected data.
     Passed to AgentSession as userdata.
     """
+
     # Conversation state tracking
     state: ConversationState = ConversationState.GREETING
 
@@ -176,6 +182,9 @@ class AizelleeUserData:
     # Track number of clarification attempts (to avoid infinite loops)
     clarification_attempts: int = 0
     max_clarification_attempts: int = 2
+
+    # Monotonic start time for call duration tracking
+    call_start_time: float = 0.0
 
     def reset_clarification_counter(self):
         """Reset clarification counter when moving to new state."""
@@ -193,55 +202,292 @@ class AizelleeUserData:
 
 def log_route_decision(route_decision: RouteDecision) -> None:
     """Log the final routing decision for analytics."""
-    logger.info(
-        "ROUTE_DECISION: %s",
-        json.dumps(route_decision.to_log_dict(), indent=2)
-    )
+    logger.info("ROUTE_DECISION: %s", json.dumps(route_decision.to_log_dict(), indent=2))
 
 
 # Keyword mapping for intent classification
+# Keywords are ordered roughly by specificity (longer = more specific = higher precedence)
 INTENT_KEYWORDS: dict[str, list[str]] = {
-    "new_quote": ["quote", "new policy", "get insurance", "price", "how much", "estimate"],
-    "payment_or_id_dec": ["payment", "pay bill", "id card", "insurance card", "declaration", "dec page"],
-    "make_change": ["change", "add a vehicle", "add vehicle", "add a car", "add car", "remove", "update address", "modify"],
-    "cancellation": ["cancel", "cancellation", "stop policy", "end my policy"],
-    "coverage_questions": ["coverage", "covered", "does my policy cover", "what's covered", "am i covered"],
-    "annual_review": ["review", "annual", "check discounts", "review my policy", "discount"],
-    "mortgagee_lienholder": ["mortgagee", "lienholder", "mortgage company", "bank"],
-    "certificates": ["certificate", "certificate of insurance", "coi", "proof of insurance"],
-    "claims": ["claim", "accident", "file a claim", "damage", "incident"],
-    "hours_location": ["hours", "open", "location", "address", "directions", "when are you"],
-    "specific_agent": ["speak to", "talk to", "looking for", "is there", "agent named"],
+    "new_quote": [
+        "new quote",
+        "get a quote",
+        "need a quote",
+        "quote for",
+        "price quote",
+        "insurance quote",
+        "how much",
+        "pricing",
+        "new policy",
+        "start a policy",
+        "want insurance",
+        "looking for insurance",
+        "shop for insurance",
+        "quote",
+        "get insurance",
+        "price",
+        "estimate",
+    ],
+    "payment_or_id_dec": [
+        # Payment
+        "make a payment",
+        "pay bill",
+        "pay my bill",
+        "payment",
+        "paid",
+        # ID card variants + STT mishearings
+        "id card",
+        "i d card",
+        "i d",
+        "i.d.",
+        "i.d. card",
+        "identification card",
+        "insurance card",
+        "auto id",
+        "policy card",
+        # Proof of insurance
+        "proof of insurance",
+        "evidence of insurance",
+        # Dec page variants + STT mishearings
+        "dec page",
+        "deck page",
+        "declaration page",
+        "declarations page",
+        "declaration",
+        "declarations",
+    ],
+    "make_change": [
+        "make a change",
+        "change my",
+        "add a vehicle",
+        "add vehicle",
+        "add a car",
+        "remove vehicle",
+        "remove a vehicle",
+        "change address",
+        "new address",
+        "update address",
+        "add driver",
+        "remove driver",
+        "change coverage",
+        "update coverage",
+        "update policy",
+        "update my policy",
+        "modify policy",
+        "change my policy",
+        "change my coverage",
+        "add car",
+        "remove",
+        "modify",
+        "update my",
+        "change",
+    ],
+    "cancellation": [
+        "cancel my policy",
+        "cancel policy",
+        "cancel insurance",
+        "cancel my auto",
+        "cancel",
+        "cancellation",
+        "terminate",
+        "terminate coverage",
+        "stop insurance",
+        "stop my insurance",
+        "discontinue",
+        "end my policy",
+        "stop policy",
+        "stop coverage",
+    ],
+    "coverage_questions": [
+        "coverage question",
+        "what does my policy cover",
+        "what am i covered for",
+        "what am i covered",
+        "covered for",
+        "am i covered",
+        "deductible",
+        "limits",
+        "coverage limits",
+        "premium",
+        "rate went up",
+        "why did my rate",
+        "rate increase",
+        "explain coverage",
+        "understand policy",
+        "coverage",
+        "covered",
+        "whats covered",
+        "explain my coverage",
+        "understand my policy",
+    ],
+    "annual_review": [
+        "annual review",
+        "policy review",
+        "renewal",
+        "renew",
+        "renew my policy",
+        "renew insurance",
+        "up for renewal",
+        "re-shop",
+        "reshop",
+        "review my policy",
+        "check discounts",
+        "discount",
+        "policy is up for renewal",
+    ],
+    "mortgagee_lienholder": [
+        "mortgagee",
+        "mortgage",
+        "mortgage company",
+        "mortgage update",
+        "lienholder",
+        "lien holder",
+        "lien",
+        "bank information",
+        "escrow",
+        "loan company",
+        "loss payee",
+    ],
+    "certificates": [
+        "certificate of insurance",
+        "certificate",
+        "coi",
+        "c.o.i.",
+        "c o i",
+        "acord",
+        "acord form",
+        "acord certificate",
+        "send a certificate",
+        "evidence of coverage",
+    ],
+    "claims": [
+        "file a claim",
+        "make a claim",
+        "report a claim",
+        "claim",
+        "claims",
+        "accident",
+        "had an accident",
+        "car accident",
+        "damage",
+        "report damage",
+        "vandalism",
+        "theft",
+        "stolen",
+        "incident",
+        "collision",
+        "hit",
+    ],
+    "hours_location": [
+        "hours",
+        "what are your hours",
+        "when do you open",
+        "when do you close",
+        "business hours",
+        "open today",
+        "location",
+        "where are you",
+        "located",
+        "directions",
+        "address",
+        "how do i get there",
+        "hours of operation",
+        "where are you located",
+        "open",
+        "when are you",
+    ],
+    "specific_agent": [
+        "talk to",
+        "speak to",
+        "speak with",
+        "transfer to",
+        "connect me",
+        "extension",
+        "ext",
+        "reach",
+        "specific person",
+        "agent",
+        "my agent",
+        "is there",
+        "looking for",
+        "agent named",
+    ],
+    "something_else": [],  # Fallback - matches nothing specific
 }
 
 
-def classify_intent(user_input: str) -> str:
+def _normalize_text(text: str) -> str:
     """
-    Classify user input into an intent category based on keyword matching.
+    Normalize text for intent matching.
 
     Args:
-        user_input: The raw text from the caller describing why they're calling.
+        text: Raw input text
 
     Returns:
-        One of the 12 intent category strings:
-        - new_quote
-        - payment_or_id_dec
-        - make_change
-        - cancellation
-        - coverage_questions
-        - annual_review
-        - something_else
-        - mortgagee_lienholder
-        - certificates
-        - claims
-        - hours_location
-        - specific_agent
+        Normalized text: lowercase, punctuation stripped (keeping apostrophes),
+        multiple whitespace collapsed, leading/trailing whitespace stripped
     """
-    normalized_input = user_input.lower().strip()
+    # Lowercase
+    text = text.lower()
 
+    # Strip punctuation except apostrophes (for contractions like "I'm", "what's")
+    # Replace punctuation with space to avoid joining words
+    text = re.sub(r"[^\w\s']", " ", text)
+
+    # Collapse multiple whitespace to single space
+    text = re.sub(r"\s+", " ", text)
+
+    # Strip leading/trailing whitespace
+    text = text.strip()
+
+    return text
+
+
+def classify_intent(text: str) -> str:
+    """
+    Classify caller intent using keyword matching with precedence scoring.
+
+    Uses a scoring system where longer/more specific keyword matches get higher
+    scores. When multiple intents match, returns the one with the highest score.
+    This ensures specific intents (claims, certificates, cancellation, mortgagee)
+    beat generic matches.
+
+    Args:
+        text: Raw transcript text from STT
+
+    Returns:
+        Intent category string (always returns valid IntentCategory value)
+
+    Examples:
+        >>> classify_intent("cancel my policy")
+        'cancellation'
+        >>> classify_intent("update my policy")
+        'make_change'
+        >>> classify_intent("file a claim for accident damage")
+        'claims'
+        >>> classify_intent("certificate of insurance")
+        'certificates'
+    """
+    if not text or not text.strip():
+        return "something_else"
+
+    normalized = _normalize_text(text)
+
+    # Score each intent based on keyword matches
+    # Longer keyword matches get higher scores (more specific)
+    scores: dict[str, int] = {}
     for intent, keywords in INTENT_KEYWORDS.items():
+        if intent == "something_else":
+            continue
+        score = 0
         for keyword in keywords:
-            if keyword in normalized_input:
-                return intent
+            if keyword in normalized:
+                # Score = length of keyword (longer = more specific)
+                score = max(score, len(keyword))
+        if score > 0:
+            scores[intent] = score
 
-    return "something_else"
+    if not scores:
+        return "something_else"
+
+    # Return intent with highest score
+    return max(scores, key=scores.get)
