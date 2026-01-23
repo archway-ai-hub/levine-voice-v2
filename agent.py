@@ -10,6 +10,8 @@ Uses function tools to capture caller information and update the RouteDecision.
 import logging
 import re
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -29,8 +31,19 @@ from models import (
     ConversationState,
     InsuranceType,
     IntentCategory,
+    RouteDecision,
     classify_intent,
     log_route_decision,
+)
+from staff_directory import (
+    CL_AE_FALLBACK,
+    GENERAL_FALLBACK,
+    PL_AE_FALLBACK,
+    STAFF_DIRECTORY,
+    normalize_last_name,
+    pick_cl_ae,
+    pick_pl_ae,
+    pick_pl_sales,
 )
 
 # Load environment variables from .env file
@@ -163,15 +176,34 @@ After acknowledging their reason for calling, collect info in this order:
    FOR NEW QUOTES (intent = new_quote):
    - Business: "What's the business name?"
    - Personal: "And the last name?" (accept as given, don't ask to spell)
+     * SKIP this if caller already gave full name (first AND last) - we can derive it
 
    FOR EXISTING POLICY SERVICING (all other intents):
    - Business: "What's the business name on the policy?"
    - Personal: "What's the last name on the policy?"
+     * SKIP this if caller already gave full name (first AND last) - we can derive it
      * For policy servicing, confirm unclear names by asking to spell if needed
 
-6. When all fields are collected -> Wrap up the call
+6. When all fields are collected -> Transfer the call (see ENDING THE CALL)
 
 Never ask for info you already have. Never re-ask intent after they've stated it.
+
+CLARIFYING QUESTIONS FOR ROUTING:
+When you need specific information to route the call, ask these questions naturally:
+
+- Insurance Type (when you don't know if it's business or personal):
+  "Is this for your business or personal insurance?"
+
+- Business Name (for business insurance calls):
+  "What's the name of your business?"
+
+- Last Name (for personal insurance when unclear):
+  "Can you spell your last name for me?"
+
+- Specific Agent (when caller asks for someone but you can't find them):
+  "Who are you trying to reach?"
+
+Only ask these when needed - don't ask every caller all questions.
 
 IMPORTANT - RECORDING INFORMATION:
 Call the appropriate function tool IMMEDIATELY after collecting each piece of information:
@@ -204,9 +236,23 @@ HANDLING UNCLEAR RESPONSES:
 - Never guess at names or phone numbers
 
 ENDING THE CALL:
-Once you have everything: "Alright [name], I've got you at [phone number], calling about [reason] for your [business/personal] insurance. Someone will be in touch soon. Anything else I can help with?"
+Once you have everything needed, confirm and transfer:
+"Alright [name], I've got you at [phone number], calling about [reason] for your [business/personal] insurance. Let me connect you now."
 
-If they say no: "Thanks for calling Harry Levine Insurance. Have a great day!"
+FALLBACK/TRANSFER PHRASING:
+When transferring a call (whether after successful routing or fallback), say EXACTLY:
+"Got it — I'm going to connect you now."
+Then immediately call the transfer_to_agent tool. Do not add additional commentary, wrap-up, or alternative phrasing.
+
+IMPORTANT: Most calls should end with a transfer to the appropriate team member. The only exceptions are:
+- hours_location: Provide the info directly, no transfer needed
+- certificates: Let them know we'll email it, no transfer needed
+- mortgagee_lienholder: Let them know we'll email the update, no transfer needed
+
+For ALL other intents (quotes, payments, changes, claims, etc.), always transfer the call - never just say "anything else?" and hang up.
+
+If they have a follow-up question after transfer info: Address it, then transfer.
+If they say goodbye: "Thanks for calling Harry Levine Insurance. Have a great day!"
 
 THINGS TO AVOID:
 - Don't offer specific insurance advice or quotes
@@ -216,7 +262,7 @@ THINGS TO AVOID:
 - Don't use emojis
 - Don't ask why they're calling if they already told you
 - Don't call the record_intent tool - it's handled automatically
-- If asked something outside your role: "I'll make sure to pass that along to the team"
+- If asked something outside your role: "Got it - I'm going to connect you now."
 """
 
 
@@ -396,7 +442,8 @@ class AizelleeAgent(Agent):
         try:
             type_enum = InsuranceType(insurance_type.lower().strip())
         except ValueError:
-            type_enum = InsuranceType.PERSONAL  # Default to personal if unclear
+            logger.warning(f"Invalid insurance_type value: {insurance_type}")
+            return "ok"
         userdata.route_decision.insurance_type = type_enum
         logger.debug(f"CAPTURED insurance_type: {type_enum.value}")
         return f"Recorded insurance type: {type_enum.value}"
@@ -424,6 +471,24 @@ class AizelleeAgent(Agent):
         userdata.route_decision.policy_last_name = last_name
         logger.debug(f"CAPTURED policy_last_name: {last_name}")
         return f"Recorded policy last name: {last_name}"
+
+    @function_tool()
+    async def transfer_to_agent(
+        self,
+        context: RunContext,
+        target_name: str,
+        target_extension: str,
+        reason: str,
+    ) -> str:
+        """Transfer the call to another agent.
+
+        Args:
+            target_name: Name of the staff member to transfer to.
+            target_extension: Extension number to dial.
+            reason: Brief explanation of why transferring.
+        """
+        logger.info(f"TRANSFER: target={target_name} | ext={target_extension} | reason={reason}")
+        return "TRANSFER_OK"
 
     # -------------------------------------------------------------------------
     # Agent Lifecycle Methods
@@ -663,6 +728,300 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
     logger.info("Aizellee agent session started and connected")
+
+
+# ---------------------------------------------------------------------------
+# Call Routing
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RouteResult:
+    """Result of call routing decision."""
+
+    target_department: str  # e.g., "PL Sales", "PL AE", "CL AE", "info-only", "email", "claims"
+    target_agent: Optional[str] = None  # Agent name if transfer
+    target_extension: Optional[str] = None  # Extension number if transfer
+    transfer_reason: str = ""  # Brief explanation of routing
+
+
+# Intents that route to existing policy servicing (AE)
+_EXISTING_POLICY_INTENTS = {
+    IntentCategory.PAYMENT_OR_ID_DEC,
+    IntentCategory.MAKE_CHANGE,
+    IntentCategory.CANCELLATION,
+    IntentCategory.COVERAGE_QUESTIONS,
+    IntentCategory.ANNUAL_REVIEW,
+    IntentCategory.SPECIFIC_AGENT,
+}
+
+# Intents that require routing (need insurance_type)
+_ROUTING_INTENTS = {
+    IntentCategory.CLAIMS,
+    IntentCategory.NEW_QUOTE,
+    IntentCategory.MAKE_CHANGE,
+    IntentCategory.PAYMENT_OR_ID_DEC,
+    IntentCategory.CANCELLATION,
+    IntentCategory.COVERAGE_QUESTIONS,
+    IntentCategory.ANNUAL_REVIEW,
+    IntentCategory.SPECIFIC_AGENT,
+    IntentCategory.SOMETHING_ELSE,
+}
+
+# Intents that need alpha-split routing (business_name or last_name)
+_ALPHA_SPLIT_INTENTS = {
+    IntentCategory.NEW_QUOTE,
+    IntentCategory.MAKE_CHANGE,
+    IntentCategory.PAYMENT_OR_ID_DEC,
+    IntentCategory.CANCELLATION,
+    IntentCategory.COVERAGE_QUESTIONS,
+    IntentCategory.ANNUAL_REVIEW,
+    IntentCategory.SOMETHING_ELSE,
+}
+
+# Info-only intents that should NEVER transfer
+_NO_TRANSFER_INTENTS = {
+    IntentCategory.HOURS_LOCATION,
+    IntentCategory.CERTIFICATES,
+    IntentCategory.MORTGAGEE_LIENHOLDER,
+}
+
+# Intents that require insurance_type (everything except info-only intents)
+_REQUIRES_INSURANCE_TYPE_INTENTS = {
+    IntentCategory.CLAIMS,
+    IntentCategory.NEW_QUOTE,
+    IntentCategory.MAKE_CHANGE,
+    IntentCategory.PAYMENT_OR_ID_DEC,
+    IntentCategory.CANCELLATION,
+    IntentCategory.COVERAGE_QUESTIONS,
+    IntentCategory.ANNUAL_REVIEW,
+    IntentCategory.SPECIFIC_AGENT,
+    IntentCategory.SOMETHING_ELSE,
+}
+
+# Max retry count for routing requirements
+_MAX_ROUTING_RETRIES = 2
+
+
+def _get_staff_by_name(name: str):
+    """Look up staff member by name (case-insensitive)."""
+    name_lower = name.lower()
+    for staff in STAFF_DIRECTORY:
+        if staff.name.lower() == name_lower:
+            return staff
+    return None
+
+
+def check_routing_requirements(
+    userdata: AizelleeUserData, intent: IntentCategory
+) -> tuple[str, Optional[str], Optional[str]]:
+    """
+    Check if all routing requirements are met and return appropriate action.
+
+    This function implements bounded retry logic with graceful fallbacks for
+    route hardening. It checks each requirement and returns the appropriate
+    action to take.
+
+    Args:
+        userdata: The AizelleeUserData containing the route_decision and retry counters.
+        intent: The classified intent.
+
+    Returns:
+        A tuple of (action, value1, value2) where:
+        - ("no_transfer", None, None): Info-only intent, don't transfer
+        - ("ask", question, field_name): Need to ask for more info
+        - ("fallback", agent_name, transfer_reason): Max retries exceeded, use fallback
+        - ("ready", None, None): All requirements met, proceed with routing
+    """
+    route_decision = userdata.route_decision
+    insurance_type = route_decision.insurance_type
+
+    # -------------------------------------------------------------------------
+    # E) Transfer Guards for Info-Only Intents - NEVER transfer
+    # -------------------------------------------------------------------------
+    if intent in _NO_TRANSFER_INTENTS:
+        return ("no_transfer", None, None)
+
+    # -------------------------------------------------------------------------
+    # A) Missing Insurance Type - check BEFORE claims routing
+    # -------------------------------------------------------------------------
+    if intent in _REQUIRES_INSURANCE_TYPE_INTENTS and insurance_type is None:
+        if userdata.asked_insurance_type_count < _MAX_ROUTING_RETRIES:
+            userdata.asked_insurance_type_count += 1
+            return ("ask", "Is this for business or personal insurance?", "insurance_type")
+        else:
+            # Fallback to main line
+            return ("fallback", GENERAL_FALLBACK, "missing_insurance_type")
+
+    # -------------------------------------------------------------------------
+    # Claims routes to claims department (insurance_type now guaranteed)
+    # -------------------------------------------------------------------------
+    if intent == IntentCategory.CLAIMS:
+        return ("ready", None, None)
+
+    # -------------------------------------------------------------------------
+    # D) Specific Agent Intent - Check if agent exists
+    # -------------------------------------------------------------------------
+    if intent == IntentCategory.SPECIFIC_AGENT:
+        requested_agent = route_decision.requested_agent_name
+        if not requested_agent or not _get_staff_by_name(requested_agent):
+            if userdata.asked_specific_agent_count < _MAX_ROUTING_RETRIES:
+                userdata.asked_specific_agent_count += 1
+                return (
+                    "ask",
+                    "Who are you trying to reach? Do you know their last name or what they help you with?",
+                    "specific_agent",
+                )
+            else:
+                # Fallback to department bucket based on insurance_type
+                if insurance_type == InsuranceType.BUSINESS:
+                    return ("fallback", CL_AE_FALLBACK, "unknown_specific_agent")
+                else:
+                    return ("fallback", PL_AE_FALLBACK, "unknown_specific_agent")
+        # Agent found - proceed with routing
+        return ("ready", None, None)
+
+    # -------------------------------------------------------------------------
+    # B) Business Path Needs Business Name
+    # -------------------------------------------------------------------------
+    if insurance_type == InsuranceType.BUSINESS and intent in _ALPHA_SPLIT_INTENTS:
+        if not route_decision.business_name:
+            if userdata.asked_business_name_count < _MAX_ROUTING_RETRIES:
+                userdata.asked_business_name_count += 1
+                return ("ask", "What's the name of your business?", "business_name")
+            else:
+                return ("fallback", CL_AE_FALLBACK, "missing_business_name")
+
+    # -------------------------------------------------------------------------
+    # C) Personal Path Needs Last Name
+    # -------------------------------------------------------------------------
+    if insurance_type == InsuranceType.PERSONAL and intent in _ALPHA_SPLIT_INTENTS:
+        # First try extracting last name from caller_name
+        last_name = route_decision.policy_last_name
+        if not last_name and route_decision.caller_name:
+            # Try to extract last name from full name
+            extracted = normalize_last_name(route_decision.caller_name)
+            if extracted:
+                # Check if caller_name is a single word (no last name extractable)
+                name_parts = route_decision.caller_name.strip().split()
+                if len(name_parts) >= 2:
+                    # Multi-word name, we can use extracted last name
+                    last_name = extracted
+                    route_decision.policy_last_name = extracted
+                    logger.debug(
+                        f"CAPTURED policy_last_name: {extracted} (auto-extracted from caller_name)"
+                    )
+
+        if not last_name:
+            if userdata.asked_last_name_count < _MAX_ROUTING_RETRIES:
+                userdata.asked_last_name_count += 1
+                return ("ask", "Could you spell your last name for me?", "last_name")
+            else:
+                return ("fallback", PL_AE_FALLBACK, "missing_last_name")
+
+    # All requirements met
+    return ("ready", None, None)
+
+
+def route_call(state: RouteDecision) -> RouteResult:
+    """
+    Determine call routing based on intent and insurance type.
+
+    Args:
+        state: ConversationState (RouteDecision) with intent, insurance_type,
+               caller_name, callback_phone, business_name, policy_last_name
+
+    Returns:
+        RouteResult with target_department, target_agent, target_extension, transfer_reason
+    """
+    intent = state.intent
+    insurance_type = state.insurance_type
+
+    # -------------------------------------------------------------------------
+    # Special Cases (No Transfer)
+    # -------------------------------------------------------------------------
+
+    # Hours/location - provide info only, no transfer
+    if intent == IntentCategory.HOURS_LOCATION:
+        return RouteResult(
+            target_department="info-only",
+            transfer_reason="Caller asking about hours or location - provide info directly",
+        )
+
+    # Certificates - route to email
+    if intent == IntentCategory.CERTIFICATES:
+        return RouteResult(
+            target_department="email",
+            transfer_reason="Certificate request - email certificates to requesting party",
+        )
+
+    # Mortgagee/lienholder - route to email
+    if intent == IntentCategory.MORTGAGEE_LIENHOLDER:
+        return RouteResult(
+            target_department="email",
+            transfer_reason="Mortgagee/lienholder update - email update to mortgage company",
+        )
+
+    # Claims - route to claims department
+    if intent == IntentCategory.CLAIMS:
+        return RouteResult(
+            target_department="claims",
+            transfer_reason="Claim inquiry - route to claims department",
+        )
+
+    # -------------------------------------------------------------------------
+    # Commercial Lines (CL) - All intents route to CL AE by business name
+    # -------------------------------------------------------------------------
+
+    if insurance_type == InsuranceType.BUSINESS:
+        business_name = state.business_name or ""
+        staff = pick_cl_ae(business_name)
+        return RouteResult(
+            target_department="CL AE",
+            target_agent=staff.name,
+            target_extension=staff.ext,
+            transfer_reason=f"Commercial lines - routing to {staff.name} (ext {staff.ext}) for business '{business_name}'",
+        )
+
+    # -------------------------------------------------------------------------
+    # Personal Lines (PL)
+    # -------------------------------------------------------------------------
+
+    # Get last name for routing - from caller_name field
+    last_name = state.policy_last_name or ""
+    if not last_name and state.caller_name:
+        # Extract last name from full caller name
+        last_name = normalize_last_name(state.caller_name)
+
+    # New quote -> Sales (alpha split by last name)
+    if intent == IntentCategory.NEW_QUOTE:
+        staff = pick_pl_sales(last_name)
+        return RouteResult(
+            target_department="PL Sales",
+            target_agent=staff.name,
+            target_extension=staff.ext,
+            transfer_reason=f"New quote - routing to {staff.name} (ext {staff.ext})",
+        )
+
+    # Existing policy intents -> AE (alpha split by last name)
+    if intent in _EXISTING_POLICY_INTENTS:
+        staff = pick_pl_ae(last_name)
+        return RouteResult(
+            target_department="PL AE",
+            target_agent=staff.name,
+            target_extension=staff.ext,
+            transfer_reason=f"Existing policy service - routing to {staff.name} (ext {staff.ext})",
+        )
+
+    # something_else -> Route to appropriate AE based on insurance_type
+    # Default to personal lines AE if no insurance_type specified
+    staff = pick_pl_ae(last_name)
+    return RouteResult(
+        target_department="PL AE",
+        target_agent=staff.name,
+        target_extension=staff.ext,
+        transfer_reason=f"General inquiry - routing to {staff.name} (ext {staff.ext})",
+    )
 
 
 # ---------------------------------------------------------------------------

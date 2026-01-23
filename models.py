@@ -86,6 +86,12 @@ class RouteDecision:
     # Specific agent request (if intent == SPECIFIC_AGENT)
     requested_agent_name: Optional[str] = None
 
+    # Routing target information
+    target_department: Optional[str] = None  # "sales", "AE", "email", "info-only", "claims"
+    target_agent_name: Optional[str] = None  # e.g., "Queens", "Adriana"
+    target_extension: Optional[str] = None  # e.g., "7010"
+    transfer_reason: Optional[str] = None  # Short string explaining the transfer
+
     # Metadata
     call_timestamp: datetime = field(default_factory=datetime.now)
     call_duration_seconds: float = 0.0
@@ -105,6 +111,10 @@ class RouteDecision:
             "business_name": self.business_name,
             "policy_last_name": self.policy_last_name,
             "requested_agent_name": self.requested_agent_name,
+            "target_department": self.target_department,
+            "target_agent_name": self.target_agent_name,
+            "target_extension": self.target_extension,
+            "transfer_reason": self.transfer_reason,
             "call_timestamp": self.call_timestamp.isoformat(),
             "call_duration_seconds": self.call_duration_seconds,
             "conversation_complete": self.conversation_complete,
@@ -182,6 +192,12 @@ class AizelleeUserData:
     # Track number of clarification attempts (to avoid infinite loops)
     clarification_attempts: int = 0
     max_clarification_attempts: int = 2
+
+    # Retry counters for route hardening
+    asked_insurance_type_count: int = 0
+    asked_business_name_count: int = 0
+    asked_last_name_count: int = 0
+    asked_specific_agent_count: int = 0
 
     # Monotonic start time for call duration tracking
     call_start_time: float = 0.0

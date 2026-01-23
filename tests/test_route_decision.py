@@ -424,10 +424,12 @@ class TestInsuranceTypeMapping:
         assert mock_context.userdata.route_decision.insurance_type == InsuranceType.BUSINESS
 
     @pytest.mark.asyncio
-    async def test_invalid_insurance_type_defaults_to_personal(self, agent, mock_context):
-        """Test invalid insurance type defaults to PERSONAL."""
-        await agent.record_insurance_type(mock_context, "invalid")
-        assert mock_context.userdata.route_decision.insurance_type == InsuranceType.PERSONAL
+    async def test_invalid_insurance_type_returns_ok_silently(self, agent, mock_context):
+        """Test invalid insurance type returns 'ok' silently and does NOT set the field."""
+        result = await agent.record_insurance_type(mock_context, "invalid")
+        # Should return "ok" silently, not set the field
+        assert result == "ok"
+        assert mock_context.userdata.route_decision.insurance_type is None
 
 
 # -----------------------------------------------------------------------------
@@ -1439,7 +1441,7 @@ class TestChatModeIntentCapture:
         userdata = AizelleeUserData()
         assert userdata.route_decision.intent is None
 
-        # ChatCLI input sequence
+        # Chat input sequence
         chat_inputs = ["I need to file a claim", "Sam Ruben", "8185553212", "personal", "ruben"]
 
         # First message should set intent to CLAIMS
