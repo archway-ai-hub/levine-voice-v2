@@ -45,6 +45,7 @@ from staff_directory import (
     pick_pl_ae,
     pick_pl_sales,
 )
+from transfer_provider import TransferResult, get_transfer_provider
 
 # Load environment variables from .env file
 load_dotenv()
@@ -178,7 +179,11 @@ After acknowledging their reason for calling, collect info in this order:
    - Personal: "And the last name?" (accept as given, don't ask to spell)
      * SKIP this if caller already gave full name (first AND last) - we can derive it
 
-   FOR EXISTING POLICY SERVICING (all other intents):
+   FOR CLAIMS (intent = claims):
+   - Route to claims department - NO last_name or business_name needed
+   - Just need insurance_type (business or personal)
+
+   FOR EXISTING POLICY SERVICING (make_change, payment_or_id_dec, cancellation, coverage_questions, annual_review, something_else):
    - Business: "What's the business name on the policy?"
    - Personal: "What's the last name on the policy?"
      * SKIP this if caller already gave full name (first AND last) - we can derive it
@@ -214,6 +219,17 @@ Call the appropriate function tool IMMEDIATELY after collecting each piece of in
 - record_policy_last_name(last_name) - for personal inquiries
 
 Do NOT call record_intent - it's handled automatically by the system.
+
+TOOL DIRECTIVES - FOLLOW THESE EXACTLY:
+After calling any record_* tool, check the response for a directive:
+
+- "ok. ASK_NEXT: [question]" -> Ask this exact question
+- "ok. READY_TRANSFER: [agent] at [ext]" -> Say "Got it - I'm going to connect you now." then call transfer_to_agent with the exact agent/extension from the directive
+- "ok. READY_TRANSFER: [department]" -> Say "Got it - I'm going to connect you now." then call transfer_to_agent
+- "ok. PROVIDE_INFO_ONLY" -> Provide the requested info directly, no transfer needed
+- "ok. CONTINUE" -> Continue the conversation naturally
+
+CRITICAL: When you see READY_TRANSFER, use the EXACT agent name and extension from the directive.
 
 INTENT CLASSIFICATION (FOR REFERENCE ONLY - AUTO-CAPTURED):
 The system classifies intents into these categories:
@@ -383,7 +399,8 @@ class AizelleeAgent(Agent):
         userdata: AizelleeUserData = context.userdata
         userdata.route_decision.caller_name = name
         logger.debug(f"CAPTURED caller_name: {name}")
-        return f"Recorded caller name: {name}"
+        directive = get_ssot_directive(userdata)
+        return f"ok. {directive}"
 
     @function_tool()
     async def record_callback_phone(self, context: RunContext, phone: str) -> str:
@@ -396,7 +413,8 @@ class AizelleeAgent(Agent):
         normalized = normalize_phone_number(phone)
         userdata.route_decision.callback_phone = normalized
         logger.debug(f"CAPTURED callback_phone: {normalized} (raw: {phone})")
-        return f"Recorded callback phone: {normalized}"
+        directive = get_ssot_directive(userdata)
+        return f"ok. {directive}"
 
     @function_tool()
     async def record_intent(self, context: RunContext, raw_text: str) -> str:
@@ -443,10 +461,11 @@ class AizelleeAgent(Agent):
             type_enum = InsuranceType(insurance_type.lower().strip())
         except ValueError:
             logger.warning(f"Invalid insurance_type value: {insurance_type}")
-            return "ok"
+            return "ok. CONTINUE"
         userdata.route_decision.insurance_type = type_enum
         logger.debug(f"CAPTURED insurance_type: {type_enum.value}")
-        return f"Recorded insurance type: {type_enum.value}"
+        directive = get_ssot_directive(userdata)
+        return f"ok. {directive}"
 
     @function_tool()
     async def record_business_name(self, context: RunContext, business_name: str) -> str:
@@ -458,7 +477,8 @@ class AizelleeAgent(Agent):
         userdata: AizelleeUserData = context.userdata
         userdata.route_decision.business_name = business_name
         logger.debug(f"CAPTURED business_name: {business_name}")
-        return f"Recorded business name: {business_name}"
+        directive = get_ssot_directive(userdata)
+        return f"ok. {directive}"
 
     @function_tool()
     async def record_policy_last_name(self, context: RunContext, last_name: str) -> str:
@@ -470,7 +490,8 @@ class AizelleeAgent(Agent):
         userdata: AizelleeUserData = context.userdata
         userdata.route_decision.policy_last_name = last_name
         logger.debug(f"CAPTURED policy_last_name: {last_name}")
-        return f"Recorded policy last name: {last_name}"
+        directive = get_ssot_directive(userdata)
+        return f"ok. {directive}"
 
     @function_tool()
     async def transfer_to_agent(
@@ -487,8 +508,84 @@ class AizelleeAgent(Agent):
             target_extension: Extension number to dial.
             reason: Brief explanation of why transferring.
         """
-        logger.info(f"TRANSFER: target={target_name} | ext={target_extension} | reason={reason}")
-        return "TRANSFER_OK"
+        userdata: AizelleeUserData = context.userdata
+        route_decision = userdata.route_decision
+
+        # Use SSOT values if available (set by get_ssot_directive)
+        actual_target = route_decision.target_agent_name or target_name
+        actual_ext = route_decision.target_extension or target_extension
+        actual_reason = route_decision.transfer_reason or reason
+
+        # Log if LLM provided different values
+        if target_name != actual_target or target_extension != actual_ext:
+            logger.warning(
+                f"LLM transfer mismatch: {target_name}/{target_extension} -> SSOT: {actual_target}/{actual_ext}"
+            )
+
+        # Build caller_info dict for the transfer provider
+        caller_info = {
+            "name": route_decision.caller_name,
+            "phone": route_decision.callback_phone,
+            "intent": route_decision.intent.value if route_decision.intent else None,
+        }
+
+        # Log final route decision before transfer (per logging contract)
+        logger.info(
+            "ROUTE_DECISION: intent=%s | caller_name=%s | callback_phone=%s | insurance_type=%s | target_agent=%s | target_extension=%s | target_department=%s",
+            route_decision.intent.value if route_decision.intent else None,
+            route_decision.caller_name,
+            route_decision.callback_phone,
+            route_decision.insurance_type.value if route_decision.insurance_type else None,
+            actual_target,
+            actual_ext,
+            route_decision.target_department,
+        )
+
+        # Call the transfer provider exactly ONCE
+        provider = get_transfer_provider()
+
+        logger.info(
+            "TRANSFER_ATTEMPT provider=%s target=%s ext=%s reason=%s",
+            provider.__class__.__name__,
+            actual_target,
+            actual_ext,
+            actual_reason,
+        )
+
+        result: TransferResult = await provider.transfer(
+            target_name=actual_target,
+            target_extension=actual_ext,
+            reason=actual_reason,
+            caller_info=caller_info,
+        )
+
+        if result.status == "success":
+            logger.info(
+                "TRANSFER_RESULT status=%s provider=%s message=%s",
+                result.status,
+                result.provider,
+                result.message,
+            )
+            return "TRANSFER_OK"
+        else:
+            # Transfer failed - fall back to GENERAL_FALLBACK
+            fallback_target = GENERAL_FALLBACK
+            logger.warning(
+                "TRANSFER_FALLBACK reason=transfer_failed original_target=%s original_ext=%s message=%s",
+                actual_target,
+                actual_ext,
+                result.message,
+            )
+
+            # Update RouteDecision with fallback target
+            route_decision.target_agent_name = fallback_target
+            route_decision.target_extension = None  # main_line doesn't have an extension
+            route_decision.transfer_reason = f"Transfer failed: {result.message}"
+            route_decision.notes = (
+                f"Original target: {actual_target} (ext {actual_ext}). {route_decision.notes}"
+            )
+
+            return f"Transfer to {actual_target} failed. Please hold while I connect you to our main line."
 
     # -------------------------------------------------------------------------
     # Agent Lifecycle Methods
@@ -969,6 +1066,13 @@ def route_call(state: RouteDecision) -> RouteResult:
             transfer_reason="Claim inquiry - route to claims department",
         )
 
+    # Payment or ID card - route to VA ring group
+    if intent == IntentCategory.PAYMENT_OR_ID_DEC:
+        return RouteResult(
+            target_department="VA",
+            transfer_reason="Payment or ID card request - route to VA ring group",
+        )
+
     # -------------------------------------------------------------------------
     # Commercial Lines (CL) - All intents route to CL AE by business name
     # -------------------------------------------------------------------------
@@ -1022,6 +1126,73 @@ def route_call(state: RouteDecision) -> RouteResult:
         target_extension=staff.ext,
         transfer_reason=f"General inquiry - routing to {staff.name} (ext {staff.ext})",
     )
+
+
+# ---------------------------------------------------------------------------
+# SSOT (Single Source of Truth) Directive Functions
+# ---------------------------------------------------------------------------
+
+
+def get_extension_for_agent(agent_name: str) -> str | None:
+    """Get the extension number for a staff member by name."""
+    for staff in STAFF_DIRECTORY:
+        if staff.name.lower() == agent_name.lower():
+            return staff.ext
+    return None
+
+
+def get_ssot_directive(userdata: AizelleeUserData) -> str:
+    """
+    Generate directive string for LLM based on current routing state.
+    This is THE orchestration function - SINGLE SOURCE OF TRUTH for what agent should do next.
+    """
+    intent = userdata.route_decision.intent
+    if intent is None:
+        return "CONTINUE"
+
+    # Check requirements using existing check_routing_requirements
+    action, value1, value2 = check_routing_requirements(userdata, intent)
+
+    if action == "no_transfer":
+        return "PROVIDE_INFO_ONLY"
+
+    if action == "ready":
+        route = route_call(userdata.route_decision)
+        # Populate RouteDecision target fields
+        userdata.route_decision.target_department = route.target_department
+        userdata.route_decision.target_agent_name = route.target_agent
+        userdata.route_decision.target_extension = route.target_extension
+        userdata.route_decision.transfer_reason = route.transfer_reason
+
+        if route.target_agent:
+            return f"READY_TRANSFER: {route.target_agent} at {route.target_extension}"
+        else:
+            return f"READY_TRANSFER: {route.target_department}"
+
+    if action == "fallback":
+        # value1 is fallback agent name, value2 is reason
+        # Get fallback extension from staff directory
+        ext = get_extension_for_agent(value1)
+        dept = (
+            "CL AE"
+            if value1 == CL_AE_FALLBACK
+            else ("PL AE" if value1 == PL_AE_FALLBACK else "general")
+        )
+        userdata.route_decision.target_department = dept
+        userdata.route_decision.target_agent_name = value1
+        userdata.route_decision.target_extension = ext
+        userdata.route_decision.transfer_reason = value2
+
+        if ext:
+            return f"READY_TRANSFER: {value1} at {ext}"
+        else:
+            return f"READY_TRANSFER: {value1}"
+
+    if action == "ask":
+        # value1 is question, value2 is field name (counter already incremented in check_routing_requirements)
+        return f"ASK_NEXT: {value1}"
+
+    return "CONTINUE"
 
 
 # ---------------------------------------------------------------------------

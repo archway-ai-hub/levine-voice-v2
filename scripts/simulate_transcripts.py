@@ -114,11 +114,11 @@ SCENARIOS: dict[str, ScenarioConfig] = {
         expected_phone="5559876543",
         insurance_type=InsuranceType.BUSINESS,
         business_name="Smith Industries",
-        # Smith Industries -> S is in P-Z -> Dionna (CL AE)
+        # Payment/ID card requests route to VA ring group regardless of insurance type
         expected_route=ExpectedRoute(
-            target_department="CL AE",
-            target_agent_name="Dionna",
-            target_extension="7006",
+            target_department="VA",
+            target_agent_name=None,
+            target_extension=None,
         ),
     ),
     "payment_or_id_dec_personal": ScenarioConfig(
@@ -128,11 +128,11 @@ SCENARIOS: dict[str, ScenarioConfig] = {
         expected_phone="5551112222",
         insurance_type=InsuranceType.PERSONAL,
         policy_last_name="Adams",
-        # Adams -> A is in A-G -> Yarislyn (PL AE)
+        # Payment/ID card requests route to VA ring group regardless of insurance type
         expected_route=ExpectedRoute(
-            target_department="PL AE",
-            target_agent_name="Yarislyn",
-            target_extension="7011",
+            target_department="VA",
+            target_agent_name=None,
+            target_extension=None,
         ),
     ),
     # -------------------------------------------------------------------------
@@ -153,11 +153,11 @@ SCENARIOS: dict[str, ScenarioConfig] = {
         expected_phone="5551234567",
         insurance_type=InsuranceType.PERSONAL,
         policy_last_name="Doe",  # Auto-extracted from "Jane Doe"
-        # Doe -> D is in A-G -> Yarislyn (PL AE)
+        # Payment/ID card requests route to VA ring group regardless of insurance type
         expected_route=ExpectedRoute(
-            target_department="PL AE",
-            target_agent_name="Yarislyn",
-            target_extension="7011",
+            target_department="VA",
+            target_agent_name=None,
+            target_extension=None,
         ),
     ),
     # -------------------------------------------------------------------------

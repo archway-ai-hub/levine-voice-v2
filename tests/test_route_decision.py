@@ -114,7 +114,8 @@ class TestFunctionTools:
         result = await agent.record_caller_name(mock_context, "Sam Reuben")
 
         assert mock_context.userdata.route_decision.caller_name == "Sam Reuben"
-        assert "Sam Reuben" in result
+        # SSOT returns directive format
+        assert result.startswith("ok.")
 
     @pytest.mark.asyncio
     async def test_record_callback_phone(self, agent, mock_context):
@@ -122,7 +123,8 @@ class TestFunctionTools:
         result = await agent.record_callback_phone(mock_context, "555-123-4567")
 
         assert mock_context.userdata.route_decision.callback_phone == "5551234567"
-        assert "5551234567" in result
+        # SSOT returns directive format
+        assert result.startswith("ok.")
 
     @pytest.mark.asyncio
     async def test_record_callback_phone_spoken_numbers(self, agent, mock_context):
@@ -354,12 +356,18 @@ class TestCompleteConversationSimulation:
 
     @pytest.mark.asyncio
     async def test_route_decision_incomplete_without_policy_last_name(self, agent, mock_context):
-        """Test that RouteDecision.is_complete() returns False for personal without last name."""
-        await agent.record_caller_name(mock_context, "Sam Reuben")
+        """Test that RouteDecision.is_complete() returns False for personal without last name.
+
+        Note: SSOT now auto-extracts last name from full names like "Sam Reuben".
+        To test truly incomplete, use a first-name only caller_name.
+        """
+        await agent.record_caller_name(
+            mock_context, "Sam"
+        )  # First name only - no last name to extract
         await agent.record_callback_phone(mock_context, "5551234567")
         await agent.record_intent(mock_context, "I need to get a quote")
         await agent.record_insurance_type(mock_context, "personal")
-        # Policy last name not recorded
+        # Policy last name not recorded and cannot be extracted from "Sam"
 
         route_decision = mock_context.userdata.route_decision
         assert route_decision.is_complete() is False
@@ -427,8 +435,8 @@ class TestInsuranceTypeMapping:
     async def test_invalid_insurance_type_returns_ok_silently(self, agent, mock_context):
         """Test invalid insurance type returns 'ok' silently and does NOT set the field."""
         result = await agent.record_insurance_type(mock_context, "invalid")
-        # Should return "ok" silently, not set the field
-        assert result == "ok"
+        # Should return "ok. CONTINUE" (SSOT directive format), not set the field
+        assert result == "ok. CONTINUE"
         assert mock_context.userdata.route_decision.insurance_type is None
 
 

@@ -13,11 +13,13 @@ Test Categories:
 4. PL AE Alpha Split (A-G, H-M, N-Z)
 5. CL AE Alpha Split (A-F, G-O, P-Z)
 6. Intent Routing (route_call function)
+7. Pre-Routing Requirements Tests (check_routing_requirements)
+8. SSOT Edge Cases for Regression Prevention
 """
 
 import pytest
 
-from agent import check_routing_requirements, route_call
+from agent import check_routing_requirements, get_ssot_directive, route_call
 from models import AizelleeUserData, InsuranceType, IntentCategory, RouteDecision
 from staff_directory import (
     CL_AE_FALLBACK,
@@ -557,7 +559,6 @@ class TestRouteCallExistingPolicyIntents:
     @pytest.mark.parametrize(
         "intent",
         [
-            IntentCategory.PAYMENT_OR_ID_DEC,
             IntentCategory.MAKE_CHANGE,
             IntentCategory.CANCELLATION,
             IntentCategory.COVERAGE_QUESTIONS,
@@ -579,7 +580,6 @@ class TestRouteCallExistingPolicyIntents:
     @pytest.mark.parametrize(
         "intent",
         [
-            IntentCategory.PAYMENT_OR_ID_DEC,
             IntentCategory.MAKE_CHANGE,
             IntentCategory.CANCELLATION,
             IntentCategory.COVERAGE_QUESTIONS,
@@ -597,6 +597,26 @@ class TestRouteCallExistingPolicyIntents:
 
         assert result.target_department == "CL AE"
         assert result.target_agent == "Adriana"
+
+    def test_payment_or_id_dec_routes_to_va(self, route_decision):
+        """Test payment_or_id_dec routes to VA ring group regardless of insurance type."""
+        route_decision.intent = IntentCategory.PAYMENT_OR_ID_DEC
+        route_decision.insurance_type = InsuranceType.PERSONAL
+
+        result = route_call(route_decision)
+
+        assert result.target_department == "VA"
+        assert result.transfer_reason == "Payment or ID card request - route to VA ring group"
+
+    def test_payment_or_id_dec_routes_to_va_for_business(self, route_decision):
+        """Test payment_or_id_dec routes to VA ring group even for business insurance."""
+        route_decision.intent = IntentCategory.PAYMENT_OR_ID_DEC
+        route_decision.insurance_type = InsuranceType.BUSINESS
+
+        result = route_call(route_decision)
+
+        assert result.target_department == "VA"
+        assert result.transfer_reason == "Payment or ID card request - route to VA ring group"
 
 
 class TestRouteCallSomethingElse:
@@ -1205,3 +1225,632 @@ class TestCheckRoutingRequirementsCounterPersistence:
 
         check_routing_requirements(userdata, IntentCategory.SPECIFIC_AGENT)
         assert userdata.asked_specific_agent_count == 2
+
+
+# =============================================================================
+# 8. SSOT Edge Cases for Regression Prevention
+# =============================================================================
+
+
+def create_test_userdata() -> AizelleeUserData:
+    """Factory function for creating fresh test userdata."""
+    return AizelleeUserData()
+
+
+class TestSSOTClaimsNeverAsksLastName:
+    """Tests ensuring claims intent NEVER triggers a last_name ask."""
+
+    def test_claims_never_asks_for_last_name_personal(self):
+        """Claims should route directly without requiring last_name for personal."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.CLAIMS
+        userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+
+        action, _, _ = check_routing_requirements(userdata, IntentCategory.CLAIMS)
+        assert action == "ready", f"Expected 'ready' for claims, got '{action}'"
+
+        # Also verify via SSOT directive
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive, f"Expected READY_TRANSFER, got: {directive}"
+        assert "ASK_NEXT" not in directive, f"Claims should not ask, got: {directive}"
+        assert "last_name" not in directive.lower(), "Claims should not mention last_name"
+
+    def test_claims_never_asks_for_last_name_business(self):
+        """Claims should route directly without requiring business_name for business."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.CLAIMS
+        userdata.route_decision.insurance_type = InsuranceType.BUSINESS
+
+        action, _, _ = check_routing_requirements(userdata, IntentCategory.CLAIMS)
+        assert action == "ready", f"Expected 'ready' for claims, got '{action}'"
+
+        # Also verify via SSOT directive
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive, f"Expected READY_TRANSFER, got: {directive}"
+        assert "ASK_NEXT" not in directive, f"Claims should not ask, got: {directive}"
+        assert "business_name" not in directive.lower()
+
+    def test_claims_only_needs_insurance_type(self):
+        """Claims only needs insurance_type, then goes directly to ready."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.CLAIMS
+        # insurance_type is None initially
+
+        action, question, field = check_routing_requirements(userdata, IntentCategory.CLAIMS)
+        assert action == "ask", "Claims without insurance_type should ask"
+        assert field == "insurance_type"
+
+        # Set insurance_type, should now be ready
+        userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+
+        action, _, _ = check_routing_requirements(userdata, IntentCategory.CLAIMS)
+        assert action == "ready", "Claims with insurance_type should be ready"
+
+
+class TestSSOTRetryCounterCapsAtTwo:
+    """Tests ensuring fallback is triggered after exactly 2 asks."""
+
+    def test_insurance_type_fallback_after_exactly_two_asks(self):
+        """Should fallback after exactly 2 asks for insurance_type."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.CLAIMS
+
+        # First ask (count goes from 0 to 1)
+        assert userdata.asked_insurance_type_count == 0
+        action1, _, _ = check_routing_requirements(userdata, IntentCategory.CLAIMS)
+        assert action1 == "ask"
+        assert userdata.asked_insurance_type_count == 1
+
+        # Second ask (count goes from 1 to 2)
+        action2, _, _ = check_routing_requirements(userdata, IntentCategory.CLAIMS)
+        assert action2 == "ask"
+        assert userdata.asked_insurance_type_count == 2
+
+        # Third call should fallback (count is at 2, which is >= MAX_RETRIES)
+        action3, agent, reason = check_routing_requirements(userdata, IntentCategory.CLAIMS)
+        assert action3 == "fallback", f"Expected 'fallback', got '{action3}'"
+        assert agent == GENERAL_FALLBACK
+        assert "missing_insurance_type" in reason
+
+    def test_last_name_fallback_after_exactly_two_asks(self):
+        """Should fallback after exactly 2 asks for last_name."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.NEW_QUOTE
+        userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+
+        # First ask (count goes from 0 to 1)
+        assert userdata.asked_last_name_count == 0
+        action1, _, _ = check_routing_requirements(userdata, IntentCategory.NEW_QUOTE)
+        assert action1 == "ask"
+        assert userdata.asked_last_name_count == 1
+
+        # Second ask (count goes from 1 to 2)
+        action2, _, _ = check_routing_requirements(userdata, IntentCategory.NEW_QUOTE)
+        assert action2 == "ask"
+        assert userdata.asked_last_name_count == 2
+
+        # Third call should fallback
+        action3, agent, reason = check_routing_requirements(userdata, IntentCategory.NEW_QUOTE)
+        assert action3 == "fallback", f"Expected 'fallback', got '{action3}'"
+        assert agent == PL_AE_FALLBACK
+        assert "missing_last_name" in reason
+
+    def test_business_name_fallback_after_exactly_two_asks(self):
+        """Should fallback after exactly 2 asks for business_name."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.NEW_QUOTE
+        userdata.route_decision.insurance_type = InsuranceType.BUSINESS
+
+        # First ask (count goes from 0 to 1)
+        assert userdata.asked_business_name_count == 0
+        action1, _, _ = check_routing_requirements(userdata, IntentCategory.NEW_QUOTE)
+        assert action1 == "ask"
+        assert userdata.asked_business_name_count == 1
+
+        # Second ask (count goes from 1 to 2)
+        action2, _, _ = check_routing_requirements(userdata, IntentCategory.NEW_QUOTE)
+        assert action2 == "ask"
+        assert userdata.asked_business_name_count == 2
+
+        # Third call should fallback
+        action3, agent, reason = check_routing_requirements(userdata, IntentCategory.NEW_QUOTE)
+        assert action3 == "fallback", f"Expected 'fallback', got '{action3}'"
+        assert agent == CL_AE_FALLBACK
+        assert "missing_business_name" in reason
+
+
+class TestSSOTReadyTransferPopulatesTargetFields:
+    """Tests that READY_TRANSFER directive populates target_* fields in RouteDecision."""
+
+    def test_ready_transfer_populates_route_decision_target_fields_claims(self):
+        """READY_TRANSFER directive should populate target_* fields for claims."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.CLAIMS
+        userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive
+
+        # Verify target fields are populated
+        assert userdata.route_decision.target_department is not None
+        assert userdata.route_decision.target_department == "claims"
+
+    def test_ready_transfer_populates_route_decision_target_fields_pl_sales(self):
+        """READY_TRANSFER directive should populate target_* fields for PL Sales."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.NEW_QUOTE
+        userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+        userdata.route_decision.policy_last_name = "Adams"  # A -> Queens
+
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive
+
+        # Verify target fields are populated
+        assert userdata.route_decision.target_department == "PL Sales"
+        assert userdata.route_decision.target_agent_name == "Queens"
+        assert userdata.route_decision.target_extension is not None
+
+    def test_ready_transfer_populates_route_decision_target_fields_cl_ae(self):
+        """READY_TRANSFER directive should populate target_* fields for CL AE."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.MAKE_CHANGE
+        userdata.route_decision.insurance_type = InsuranceType.BUSINESS
+        userdata.route_decision.business_name = "Acme Corp"  # A -> Adriana
+
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive
+
+        # Verify target fields are populated
+        assert userdata.route_decision.target_department == "CL AE"
+        assert userdata.route_decision.target_agent_name == "Adriana"
+        assert userdata.route_decision.target_extension is not None
+
+
+class TestSSOTFallbackPopulatesTargetFields:
+    """Tests that fallback paths populate target_* fields."""
+
+    def test_fallback_populates_target_fields_pl_ae(self):
+        """Fallback to PL AE should populate target_* fields."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.MAKE_CHANGE
+        userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+        userdata.asked_last_name_count = 2  # Max retries exceeded
+
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive
+
+        # Verify target fields are populated with fallback agent
+        assert userdata.route_decision.target_agent_name == PL_AE_FALLBACK  # "Al"
+        assert userdata.route_decision.target_extension is not None
+        assert userdata.route_decision.transfer_reason == "missing_last_name"
+
+    def test_fallback_populates_target_fields_cl_ae(self):
+        """Fallback to CL AE should populate target_* fields."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.MAKE_CHANGE
+        userdata.route_decision.insurance_type = InsuranceType.BUSINESS
+        userdata.asked_business_name_count = 2  # Max retries exceeded
+
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive
+
+        # Verify target fields are populated with fallback agent
+        assert userdata.route_decision.target_agent_name == CL_AE_FALLBACK  # "Dionna"
+        assert userdata.route_decision.target_extension is not None
+        assert userdata.route_decision.transfer_reason == "missing_business_name"
+
+    def test_fallback_populates_target_fields_general(self):
+        """Fallback to general line should populate target_* fields."""
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.MAKE_CHANGE
+        # No insurance_type set
+        userdata.asked_insurance_type_count = 2  # Max retries exceeded
+
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive
+
+        # Verify target fields are populated with fallback agent
+        assert userdata.route_decision.target_agent_name == GENERAL_FALLBACK
+        assert userdata.route_decision.transfer_reason == "missing_insurance_type"
+
+
+class TestSSOTNoDeadEndStates:
+    """Tests that every valid state produces a meaningful directive (no empty/None)."""
+
+    def test_no_dead_end_states_all_intents(self):
+        """Every intent should produce a valid directive (not None or empty)."""
+        for intent in IntentCategory:
+            userdata = create_test_userdata()
+            userdata.route_decision.intent = intent
+
+            directive = get_ssot_directive(userdata)
+            assert directive is not None, f"Directive was None for intent {intent.value}"
+            assert directive != "", f"Directive was empty for intent {intent.value}"
+
+            # Must be one of the valid directive types
+            valid_prefixes = ("CONTINUE", "PROVIDE_INFO_ONLY", "ASK_NEXT", "READY_TRANSFER")
+            assert any(
+                directive.startswith(prefix) or directive == prefix for prefix in valid_prefixes
+            ), f"Invalid directive '{directive}' for intent {intent.value}"
+
+    def test_no_dead_end_states_no_intent(self):
+        """Userdata with no intent should return CONTINUE."""
+        userdata = create_test_userdata()
+        # No intent set
+
+        directive = get_ssot_directive(userdata)
+        assert directive == "CONTINUE"
+
+    def test_no_dead_end_with_various_insurance_types(self):
+        """Various insurance types with routing intents should produce directives."""
+        routing_intents = [
+            IntentCategory.NEW_QUOTE,
+            IntentCategory.MAKE_CHANGE,
+            IntentCategory.CLAIMS,
+            IntentCategory.PAYMENT_OR_ID_DEC,
+        ]
+
+        for intent in routing_intents:
+            # Test with no insurance_type
+            userdata = create_test_userdata()
+            userdata.route_decision.intent = intent
+
+            directive = get_ssot_directive(userdata)
+            assert directive is not None and directive != "", (
+                f"Dead end for {intent.value} with no insurance_type"
+            )
+
+            # Test with personal insurance
+            userdata = create_test_userdata()
+            userdata.route_decision.intent = intent
+            userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+
+            directive = get_ssot_directive(userdata)
+            assert directive is not None and directive != "", (
+                f"Dead end for {intent.value} with personal insurance"
+            )
+
+            # Test with business insurance
+            userdata = create_test_userdata()
+            userdata.route_decision.intent = intent
+            userdata.route_decision.insurance_type = InsuranceType.BUSINESS
+
+            directive = get_ssot_directive(userdata)
+            assert directive is not None and directive != "", (
+                f"Dead end for {intent.value} with business insurance"
+            )
+
+    def test_info_only_intents_produce_provide_info_only(self):
+        """Info-only intents should produce PROVIDE_INFO_ONLY directive."""
+        info_only_intents = [
+            IntentCategory.HOURS_LOCATION,
+            IntentCategory.CERTIFICATES,
+            IntentCategory.MORTGAGEE_LIENHOLDER,
+        ]
+
+        for intent in info_only_intents:
+            userdata = create_test_userdata()
+            userdata.route_decision.intent = intent
+
+            directive = get_ssot_directive(userdata)
+            assert directive == "PROVIDE_INFO_ONLY", (
+                f"Expected PROVIDE_INFO_ONLY for {intent.value}, got: {directive}"
+            )
+
+    def test_complete_routing_scenarios_produce_ready_transfer(self):
+        """Complete routing scenarios should produce READY_TRANSFER."""
+        # Personal lines with all info
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.NEW_QUOTE
+        userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+        userdata.route_decision.policy_last_name = "Smith"
+
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive, f"Expected READY_TRANSFER, got: {directive}"
+
+        # Business lines with all info
+        userdata = create_test_userdata()
+        userdata.route_decision.intent = IntentCategory.MAKE_CHANGE
+        userdata.route_decision.insurance_type = InsuranceType.BUSINESS
+        userdata.route_decision.business_name = "Acme Corp"
+
+        directive = get_ssot_directive(userdata)
+        assert "READY_TRANSFER" in directive, f"Expected READY_TRANSFER, got: {directive}"
+
+
+# =============================================================================
+# 9. Transfer Failure Fallback Tests (Phase 2.4)
+# =============================================================================
+
+
+class TestTransferToAgentFallbackBehavior:
+    """Tests for transfer_to_agent fallback behavior when provider fails."""
+
+    @pytest.fixture
+    def agent(self):
+        """Create an AizelleeAgent instance for testing."""
+        from agent import AizelleeAgent
+
+        return AizelleeAgent()
+
+    @pytest.fixture
+    def mock_run_context(self):
+        """Create a mock RunContext with userdata containing RouteDecision."""
+        from unittest.mock import MagicMock
+
+        ctx = MagicMock()
+        userdata = AizelleeUserData()
+        # Pre-populate some fields
+        userdata.route_decision.caller_name = "John Smith"
+        userdata.route_decision.callback_phone = "5551234567"
+        userdata.route_decision.intent = IntentCategory.NEW_QUOTE
+        userdata.route_decision.insurance_type = InsuranceType.PERSONAL
+        userdata.route_decision.policy_last_name = "Smith"
+        ctx.userdata = userdata
+        return ctx
+
+    @pytest.mark.asyncio
+    async def test_provider_called_exactly_once_on_success(self, agent, mock_run_context):
+        """Test that provider.transfer() is called exactly once on success."""
+        from unittest.mock import AsyncMock, patch
+
+        from transfer_provider import TransferResult, reset_transfer_provider
+
+        # Reset singleton to ensure fresh mock
+        reset_transfer_provider()
+
+        mock_provider = AsyncMock()
+        mock_provider.transfer = AsyncMock(
+            return_value=TransferResult(
+                status="success",
+                provider="mock",
+                message="Transfer succeeded",
+            )
+        )
+
+        with patch("agent.get_transfer_provider", return_value=mock_provider):
+            result = await agent.transfer_to_agent(
+                mock_run_context,
+                target_name="Queens",
+                target_extension="7010",
+                reason="New quote request",
+            )
+
+        # Verify provider.transfer was called exactly once
+        assert mock_provider.transfer.call_count == 1
+        assert result == "TRANSFER_OK"
+
+    @pytest.mark.asyncio
+    async def test_provider_called_exactly_once_on_failure(self, agent, mock_run_context):
+        """Test that provider.transfer() is called exactly once even on failure."""
+        from unittest.mock import AsyncMock, patch
+
+        from transfer_provider import TransferResult, reset_transfer_provider
+
+        # Reset singleton to ensure fresh mock
+        reset_transfer_provider()
+
+        mock_provider = AsyncMock()
+        mock_provider.transfer = AsyncMock(
+            return_value=TransferResult(
+                status="failure",
+                provider="mock",
+                message="Simulated transfer failure",
+            )
+        )
+
+        with patch("agent.get_transfer_provider", return_value=mock_provider):
+            result = await agent.transfer_to_agent(
+                mock_run_context,
+                target_name="Queens",
+                target_extension="7010",
+                reason="New quote request",
+            )
+
+        # Verify provider.transfer was called exactly once (no retry)
+        assert mock_provider.transfer.call_count == 1
+        # Should return fallback message, not TRANSFER_OK
+        assert "failed" in result.lower() or "main line" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_failure_triggers_fallback_to_general(self, agent, mock_run_context):
+        """Test that transfer failure updates RouteDecision to GENERAL_FALLBACK."""
+        from unittest.mock import AsyncMock, patch
+
+        from transfer_provider import TransferResult, reset_transfer_provider
+
+        # Reset singleton to ensure fresh mock
+        reset_transfer_provider()
+
+        mock_provider = AsyncMock()
+        mock_provider.transfer = AsyncMock(
+            return_value=TransferResult(
+                status="failure",
+                provider="mock",
+                message="Transfer failed due to network error",
+            )
+        )
+
+        with patch("agent.get_transfer_provider", return_value=mock_provider):
+            await agent.transfer_to_agent(
+                mock_run_context,
+                target_name="Queens",
+                target_extension="7010",
+                reason="New quote request",
+            )
+
+        # Verify RouteDecision was updated with fallback target
+        route_decision = mock_run_context.userdata.route_decision
+        assert route_decision.target_agent_name == GENERAL_FALLBACK
+        assert route_decision.target_extension is None  # main_line has no extension
+        assert "failed" in route_decision.transfer_reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_failure_preserves_original_target_in_notes(self, agent, mock_run_context):
+        """Test that original target is preserved in notes when fallback occurs."""
+        from unittest.mock import AsyncMock, patch
+
+        from transfer_provider import TransferResult, reset_transfer_provider
+
+        # Reset singleton to ensure fresh mock
+        reset_transfer_provider()
+
+        mock_provider = AsyncMock()
+        mock_provider.transfer = AsyncMock(
+            return_value=TransferResult(
+                status="failure",
+                provider="mock",
+                message="Connection timeout",
+            )
+        )
+
+        with patch("agent.get_transfer_provider", return_value=mock_provider):
+            await agent.transfer_to_agent(
+                mock_run_context,
+                target_name="Queens",
+                target_extension="7010",
+                reason="New quote request",
+            )
+
+        # Verify original target is preserved in notes
+        route_decision = mock_run_context.userdata.route_decision
+        assert "Queens" in route_decision.notes
+        assert "7010" in route_decision.notes
+
+    @pytest.mark.asyncio
+    async def test_success_returns_transfer_ok(self, agent, mock_run_context):
+        """Test that successful transfer returns TRANSFER_OK."""
+        from unittest.mock import AsyncMock, patch
+
+        from transfer_provider import TransferResult, reset_transfer_provider
+
+        # Reset singleton to ensure fresh mock
+        reset_transfer_provider()
+
+        mock_provider = AsyncMock()
+        mock_provider.transfer = AsyncMock(
+            return_value=TransferResult(
+                status="success",
+                provider="mock",
+                message="Transfer completed successfully",
+            )
+        )
+
+        with patch("agent.get_transfer_provider", return_value=mock_provider):
+            result = await agent.transfer_to_agent(
+                mock_run_context,
+                target_name="Queens",
+                target_extension="7010",
+                reason="New quote request",
+            )
+
+        assert result == "TRANSFER_OK"
+
+    @pytest.mark.asyncio
+    async def test_success_does_not_modify_route_decision_target(self, agent, mock_run_context):
+        """Test that successful transfer does not overwrite RouteDecision target."""
+        from unittest.mock import AsyncMock, patch
+
+        from transfer_provider import TransferResult, reset_transfer_provider
+
+        # Pre-set SSOT target values (as get_ssot_directive would)
+        mock_run_context.userdata.route_decision.target_agent_name = "Queens"
+        mock_run_context.userdata.route_decision.target_extension = "7010"
+
+        # Reset singleton to ensure fresh mock
+        reset_transfer_provider()
+
+        mock_provider = AsyncMock()
+        mock_provider.transfer = AsyncMock(
+            return_value=TransferResult(
+                status="success",
+                provider="mock",
+                message="Transfer completed successfully",
+            )
+        )
+
+        with patch("agent.get_transfer_provider", return_value=mock_provider):
+            await agent.transfer_to_agent(
+                mock_run_context,
+                target_name="Queens",
+                target_extension="7010",
+                reason="New quote request",
+            )
+
+        # Verify RouteDecision target was NOT modified on success
+        route_decision = mock_run_context.userdata.route_decision
+        assert route_decision.target_agent_name == "Queens"
+        assert route_decision.target_extension == "7010"
+
+    @pytest.mark.asyncio
+    async def test_transfer_uses_ssot_values_over_llm_values(self, agent, mock_run_context):
+        """Test that transfer uses SSOT target values when they differ from LLM-provided values."""
+        from unittest.mock import AsyncMock, patch
+
+        from transfer_provider import TransferResult, reset_transfer_provider
+
+        # Pre-set SSOT target values (as get_ssot_directive would)
+        mock_run_context.userdata.route_decision.target_agent_name = "Brad"
+        mock_run_context.userdata.route_decision.target_extension = "7011"
+        mock_run_context.userdata.route_decision.transfer_reason = "SSOT routing"
+
+        # Reset singleton to ensure fresh mock
+        reset_transfer_provider()
+
+        mock_provider = AsyncMock()
+        mock_provider.transfer = AsyncMock(
+            return_value=TransferResult(
+                status="success",
+                provider="mock",
+                message="Transfer completed successfully",
+            )
+        )
+
+        with patch("agent.get_transfer_provider", return_value=mock_provider):
+            # LLM provides different values
+            await agent.transfer_to_agent(
+                mock_run_context,
+                target_name="Queens",  # LLM says Queens
+                target_extension="7010",  # LLM says 7010
+                reason="LLM reason",
+            )
+
+        # Verify provider was called with SSOT values, not LLM values
+        call_args = mock_provider.transfer.call_args
+        assert call_args.kwargs["target_name"] == "Brad"
+        assert call_args.kwargs["target_extension"] == "7011"
+        assert call_args.kwargs["reason"] == "SSOT routing"
+
+    @pytest.mark.asyncio
+    async def test_transfer_passes_caller_info(self, agent, mock_run_context):
+        """Test that transfer passes caller_info to the provider."""
+        from unittest.mock import AsyncMock, patch
+
+        from transfer_provider import TransferResult, reset_transfer_provider
+
+        # Reset singleton to ensure fresh mock
+        reset_transfer_provider()
+
+        mock_provider = AsyncMock()
+        mock_provider.transfer = AsyncMock(
+            return_value=TransferResult(
+                status="success",
+                provider="mock",
+                message="Transfer completed successfully",
+            )
+        )
+
+        with patch("agent.get_transfer_provider", return_value=mock_provider):
+            await agent.transfer_to_agent(
+                mock_run_context,
+                target_name="Queens",
+                target_extension="7010",
+                reason="New quote request",
+            )
+
+        # Verify caller_info was passed correctly
+        call_args = mock_provider.transfer.call_args
+        caller_info = call_args.kwargs["caller_info"]
+        assert caller_info["name"] == "John Smith"
+        assert caller_info["phone"] == "5551234567"
+        assert caller_info["intent"] == "new_quote"
